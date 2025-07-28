@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 import requests
+import os
 
 app = Flask(__name__)
 
@@ -26,29 +27,19 @@ SUPPORTED_MODELS = [
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
     try:
-        # Get the incoming request JSON (OpenAI chat completion format)
         data = request.get_json()
 
-        # Validate model
         model = data.get("model", "qwen/qwen3-235b-a22b-thinking-2507")
         if model not in SUPPORTED_MODELS:
             return jsonify({"error": f"Model '{model}' is not supported."}), 400
 
-        # Select API key based on model
-        if model == "moonshotai/kimi-k2-instruct":
-            api_key = NOVITA_API_KEY_KIMI
-        else:
-            api_key = NOVITA_API_KEY_DEFAULT
+        api_key = NOVITA_API_KEY_KIMI if model == "moonshotai/kimi-k2-instruct" else NOVITA_API_KEY_DEFAULT
 
-        # Prepare headers for Novita API
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}"
         }
 
-        # Prepare payload for Novita API
-        # Use the same model and messages from the incoming request
-        # Add other parameters with defaults or from incoming request if present
         payload = {
             "model": model,
             "messages": data.get("messages", []),
@@ -63,13 +54,10 @@ def chat_completions():
             "repetition_penalty": data.get("repetition_penalty", 1)
         }
 
-        # Send request to Novita API
         response = requests.post(NOVITA_API_URL, headers=headers, json=payload)
         response.raise_for_status()
         novita_response = response.json()
 
-        # Transform Novita response to OpenAI compatible response format
-        # Assuming Novita response has a 'choices' list with 'message' containing 'role' and 'content'
         openai_response = {
             "id": novita_response.get("id", ""),
             "object": "chat.completion",
@@ -81,7 +69,6 @@ def chat_completions():
 
         return jsonify(openai_response)
 
-
     except requests.exceptions.RequestException as e:
         return jsonify({"error": "Request to Novita API failed", "details": str(e)}), 502
     except Exception as e:
@@ -89,4 +76,5 @@ def chat_completions():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 7860))
+    app.run(host="0.0.0.0", port=port)
