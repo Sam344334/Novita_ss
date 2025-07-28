@@ -1,12 +1,13 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 import requests
 import os
+import json
 
 app = Flask(__name__)
 
 NOVITA_API_URL = "https://api.novita.ai/v3/openai/chat/completions"
 NOVITA_API_KEY_DEFAULT = "session_czG-t1PK_spR1TcCZ44AGyKe7rvJ95jWgNQfz2FbjFm43qFr6Cnfl9w2HXT9OeQPYvRTA9QgkfGgn3cl0Z-YDg=="
-NOVITA_API_KEY_KIMI = "session_czG-t1PK_spR1TcCZ44AGyKe7rvJ95jWgNQfz2FbjFm43qFr6Cnfl9w2HXT9OeQPYvRTA9QgkfGgn3cl0Z-YDg=="
+NOVITA_API_KEY_KIMI = NOVITA_API_KEY_DEFAULT  # Same key for now
 
 SUPPORTED_MODELS = [
     "minimaxai/minimax-m1-80k",
@@ -24,14 +25,19 @@ SUPPORTED_MODELS = [
     "moonshotai/kimi-k2-instruct"
 ]
 
+@app.route("/v1/models", methods=["GET"])
+def list_models():
+    models = [{"id": model, "object": "model", "owned_by": "novita"} for model in SUPPORTED_MODELS]
+    return jsonify({"object": "list", "data": models})
+
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
     try:
         data = request.get_json()
-
         model = data.get("model", "qwen/qwen3-235b-a22b-thinking-2507")
+
         if model not in SUPPORTED_MODELS:
-            return jsonify({"error": f"Model '{model}' is not supported."}), 400
+            return jsonify({"error": {"message": f"Model '{model}' is not supported."}}), 400
 
         api_key = NOVITA_API_KEY_KIMI if model == "moonshotai/kimi-k2-instruct" else NOVITA_API_KEY_DEFAULT
 
@@ -51,29 +57,66 @@ def chat_completions():
             "top_k": data.get("top_k", 50),
             "presence_penalty": data.get("presence_penalty", 0),
             "frequency_penalty": data.get("frequency_penalty", 0),
-            "repetition_penalty": data.get("repetition_penalty", 1)
+            "repetition_penalty": data.get("repetition_penalty", 1),
+            "stream": data.get("stream", False),
+            "tools": data.get("tools"),
+            "tool_choice": data.get("tool_choice"),
+            "functions": data.get("functions"),
+            "function_call": data.get("function_call")
         }
 
-        response = requests.post(NOVITA_API_URL, headers=headers, json=payload)
-        response.raise_for_status()
-        novita_response = response.json()
+        payload = {k: v for k, v in payload.items() if v is not None}
 
-        openai_response = {
+        # ====== Streaming response handling ======
+        if payload.get("stream"):
+            def event_stream():
+                try:
+                    r = requests.post(NOVITA_API_URL, headers=headers, json=payload, stream=True)
+                    for line in r.iter_lines(decode_unicode=True):
+                        if line and line.strip().startswith("{"):
+                            chunk = json.loads(line)
+                            # Normalize assistant message for stream chunks
+                            if "message" not in chunk and "content" in chunk:
+                                chunk["message"] = {
+                                    "role": "assistant",
+                                    "content": chunk["content"]
+                                }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception as e:
+                    yield f"data: {{\"error\": \"Stream failed\", \"details\": \"{str(e)}\"}}\n\n"
+
+            return Response(stream_with_context(event_stream()), mimetype='text/event-stream')
+
+        # ====== Normal (non-streaming) response ======
+        r = requests.post(NOVITA_API_URL, headers=headers, json=payload)
+        r.raise_for_status()
+        novita_response = r.json()
+
+        # Ensure every choice has a valid assistant message
+        choices = novita_response.get("choices", [])
+        for choice in choices:
+            if "message" not in choice and "content" in choice:
+                choice["message"] = {
+                    "role": "assistant",
+                    "content": choice["content"]
+                }
+
+        response_payload = {
             "id": novita_response.get("id", ""),
             "object": "chat.completion",
             "created": novita_response.get("created", 0),
-            "model": payload["model"],
-            "choices": novita_response.get("choices", []),
+            "model": model,
+            "choices": choices,
             "usage": novita_response.get("usage", {})
         }
 
-        return jsonify(openai_response)
+        return jsonify(response_payload)
 
     except requests.exceptions.RequestException as e:
-        return jsonify({"error": "Request to Novita API failed", "details": str(e)}), 502
+        return jsonify({"error": {"message": "Request to Novita API failed", "details": str(e)}}), 502
     except Exception as e:
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
-
+        return jsonify({"error": {"message": "Internal Server Error", "details": str(e)}}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
